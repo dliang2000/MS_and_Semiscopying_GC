@@ -1,0 +1,22 @@
+allocate-malign.o: allocate-malign.c
+allocate-malloc.o: allocate-malloc.c
+allocate-mmap.o: allocate-mmap.c
+allocate-win-valloc.o: allocate-win-valloc.c
+allocate.o: allocate.c ggggc/gc.h ggggc/thread-locals.h ggggc/threads.h \
+ ggggc/threads-posix.h ggggc/gc-gembc.h ggggc/push.h ggggc-internals.h \
+ allocate-malign.c
+collector-gembc.o: collector-gembc.c ggggc/gc.h ggggc/thread-locals.h \
+ ggggc/threads.h ggggc/threads-posix.h ggggc/gc-gembc.h ggggc/push.h \
+ ggggc-internals.h
+gen-barriers.o: gen-barriers.c
+globals.o: globals.c ggggc-internals.h ggggc/gc.h ggggc/thread-locals.h \
+ ggggc/threads.h ggggc/threads-posix.h ggggc/gc-gembc.h ggggc/push.h
+pushgen.o: pushgen.c
+roots.o: roots.c ggggc/gc.h ggggc/thread-locals.h ggggc/threads.h \
+ ggggc/threads-posix.h ggggc/gc-gembc.h ggggc/push.h
+threads-macosx.o: threads-macosx.c gen-barriers.c
+threads-posix.o: threads-posix.c gen-barriers.c
+threads-windows.o: threads-windows.c gen-barriers.c
+threads.o: threads.c ggggc/gc.h ggggc/thread-locals.h ggggc/threads.h \
+ ggggc/threads-posix.h ggggc/gc-gembc.h ggggc/push.h ggggc-internals.h \
+ threads-posix.c

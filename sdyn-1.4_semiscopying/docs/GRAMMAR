@@ -1,0 +1,133 @@
+The grammar for SDyn is intended to be a subset of JavaScript.
+
+In this document, nonterminals are indicated by capitalized names (e.g.
+Nonterminal), and terminals/tokens by their string representation (e.g. var or
++) or a name in angle brackets (e.g. <id>). Angle-bracket tokens are described
+in terms of regular expressions (e.g. /[id][a-z]/). The symbols ":=" and "|"
+are used as part of the grammar itself, and are not part of the language (i.e.,
+they are not terminals). The starting nonterminal is Top.
+
+The input is interpreted as ASCII octets. As described in this document, there
+exists ambiguity between keywords and identifiers. This ambiguity is always
+resolved in favor of keywords.
+
+Tokenization is greedy, with space (\x20), tab (\x09), newline (\x0A) and
+carriage return (\x0D) acting as whitespace.
+
+
+Keyword         := else
+                 | false
+                 | function
+                 | if
+                 | null
+                 | return
+                 | true
+                 | typeof
+                 | var
+                 | while
+
+
+<nil>           := //
+
+<id>            := /[a-zA-Z][a-zA-Z0-9]*/
+
+<num>           := /[1-9][0-9]*/
+
+<str>           := /"([^"\\]*(\\.)*)*"/
+
+<intrinsic>     := /\$[a-zA-Z0-9]+/
+
+
+Top             := Decls
+
+Decls           := Decl Decls
+                 | <nil>
+
+Decl            := FunDecl
+                 | VarDecl
+                 | <id> ( ) ;
+
+FunDecl         := function <id> ( Params ) { VarDecls Statements }
+
+VarDecls        := VarDecl VarDecls
+                 | <nil>
+
+VarDecl         := var <id> ;
+
+Params          := ParamList
+                 | <nil>
+
+ParamList       := Param , ParamList
+                 | Param
+
+Param           := <id>
+
+Statements      := Statement Statements
+                 | <nil>
+
+Statement       := if ( Expression ) { Statements } ElseClause
+                 | while ( Expression ) { Statements }
+                 | return Expression ;
+                 | Expression ;
+
+ElseClause      := else { Statements }
+                 | <nil>
+
+Expression      := LVal = Expression
+                 | OrExp
+
+OrExp           := OrExp || AndExp
+                 | AndExp
+
+AndExp          := AndExp && EqExp
+                 | EqExp
+
+EqExp           := EqExp == RelExp
+                 | EqExp != RelExp
+                 | RelExp
+
+RelExp          := RelExp < AddExp
+                 | RelExp > AddExp
+                 | RelExp <= AddExp
+                 | RelExp >= AddExp
+                 | AddExp
+
+AddExp          := AddExp + MulExp
+                 | AddExp - MulExp
+                 | MulExp
+
+MulExp          := MulExp * PrefixExp
+                 | MulExp % PrefixExp
+                 | PrefixExp
+
+PrefixExp       := ~ ~ ( MulExp / PrefixExp )
+                 | ! PrefixExp
+                 | typeof PrefixExp
+                 | PostfixExp
+
+PostfixExp      := PostfixExp ( Args )
+                 | PostfixExp [ Expression ]
+                 | PostfixExp . <id>
+                 | <intrinsic> ( Args )
+                 | Primary
+
+LVal            := PostfixExp [ Expression ]
+                 | PostfixExp . <id>
+                 | <id>
+                 | ( LVal )
+
+Args            := ArgList
+                 | <nil>
+
+ArgList         := Arg , ArgList
+                 | Arg
+
+Arg             := Expression
+
+Primary         := <id>
+                 | <num>
+                 | <str>
+                 | false
+                 | true
+                 | { }
+                 | ( Expression )

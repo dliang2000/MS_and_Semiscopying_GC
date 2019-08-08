@@ -1,0 +1,353 @@
+# HG changeset patch
+# Parent c67b2f27b659b87554a5ee554bd3744642ba4709
+Implementation of finalizers, as a standard list over appropriate pools to be searched after the initial trace.
+
+diff -r c67b2f27b659 allocate.c
+--- a/allocate.c	Fri Nov 27 12:05:34 2015 -0500
++++ b/allocate.c	Fri Nov 27 12:06:45 2015 -0500
+@@ -345,6 +345,47 @@
+     return ggggc_malloc(ggggc_allocateDescriptorSlot(slot));
+ }
+ 
++/* specify a finalizer for an object */
++void ggggc_finalize(void *obj, ggc_finalizer_t finalizer)
++{
++    GGGGC_FinalizerEntry entry = NULL, next = NULL;
++    struct GGGGC_Pool *pool = NULL;
++
++    GGC_PUSH_3(obj, entry, next);
++
++    /* allocate the entry */
++    entry = GGC_NEW(GGGGC_FinalizerEntry);
++
++    /* set it up */
++    GGC_WP(entry, obj, obj);
++    GGC_WD(entry, finalizer, finalizer);
++
++    /* add it to the list */
++    pool = GGGGC_POOL_OF(entry);
++    next = (GGGGC_FinalizerEntry) pool->finalizers;
++    GGC_WP(entry, next, next);
++    pool->finalizers = entry;
++}
++
++/* and function for running finalizers */
++void ggggc_runFinalizers(GGGGC_FinalizerEntry finalizers)
++{
++    GGGGC_FinalizerEntry finalizer = NULL;
++    void *obj = NULL;
++    ggc_finalizer_t ffunc;
++
++    GGC_PUSH_3(finalizers, finalizer, obj);
++
++    finalizer = finalizers;
++    while (finalizer) {
++        obj = GGC_RP(finalizer, obj);
++        ffunc = GGC_RD(finalizer, finalizer);
++        ffunc(obj);
++
++        finalizer = GGC_RP(finalizer, next);
++    }
++}
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff -r c67b2f27b659 collector-gembc.c
+--- a/collector-gembc.c	Fri Nov 27 12:05:34 2015 -0500
++++ b/collector-gembc.c	Fri Nov 27 12:06:45 2015 -0500
+@@ -170,7 +170,7 @@
+ 
+ 
+ /* full collection */
+-void ggggc_collectFull(void);
++void ggggc_collectFull(GGGGC_FinalizerEntry *survivingFinalizers, GGGGC_FinalizerEntry *survivingFinalizersTail, GGGGC_FinalizerEntry *readyFinalizers);
+ 
+ /* helper functions for full collection */
+ void ggggc_countUsed(struct GGGGC_Pool *);
+@@ -258,6 +258,53 @@
+ 
+ static struct ToSearch toSearchList;
+ 
++/* macro to handle the finalizers for a given pool */
++#define FINALIZER_POOL() do { \
++    finalizer = (GGGGC_FinalizerEntry) poolCur->finalizers; \
++    poolCur->finalizers = NULL; \
++    while (finalizer) { \
++        obj = (struct GGGGC_Header *) finalizer; \
++        if (IS_FORWARDED_OBJECT(obj)) \
++            FOLLOW_FORWARDED_OBJECT(obj); \
++        finalizer = (GGGGC_FinalizerEntry) obj; \
++        nextFinalizer = finalizer->next__ptr; \
++        \
++        /* grab the object */ \
++        obj = (struct GGGGC_Header *) finalizer->obj__ptr; \
++        if (IS_FORWARDED_OBJECT(obj)) { \
++            /* it survived, keep the finalizer */ \
++            finalizer->next__ptr = survivingFinalizers; \
++            survivingFinalizers = finalizer; \
++            if (!survivingFinalizersTail) \
++                survivingFinalizersTail = finalizer; \
++            \
++        } else { \
++            /* object died, add this to ready finalizers */ \
++            finalizer->next__ptr = readyFinalizers; \
++            readyFinalizers = finalizer; \
++            \
++        } \
++        \
++        finalizer = nextFinalizer; \
++    } \
++} while(0)
++
++/* preserve the surviving finalizers */
++#define PRESERVE_FINALIZERS() do { \
++    if (survivingFinalizers) { \
++        poolCur = GGGGC_POOL_OF(survivingFinalizers); \
++        survivingFinalizersTail->next__ptr = (GGGGC_FinalizerEntry) poolCur->finalizers; \
++        poolCur->finalizers = survivingFinalizers; \
++    } \
++} while (0)
++
++/* preserve ALL finalizers */
++#define PRESERVE_ALL_FINALIZERS() do { \
++    PRESERVE_FINALIZERS(); \
++    survivingFinalizers = readyFinalizers; \
++    PRESERVE_FINALIZERS(); \
++} while(0)
++
+ #ifdef GGGGC_DEBUG_MEMORY_CORRUPTION
+ static void memoryCorruptionCheckObj(const char *when, struct GGGGC_Header *obj)
+ {
+@@ -375,6 +422,10 @@
+     unsigned char genCur;
+     ggc_size_t i;
+ 
++    int finalizersChecked;
++    GGGGC_FinalizerEntry survivingFinalizers, survivingFinalizersTail, readyFinalizers;
++    survivingFinalizers = survivingFinalizersTail = readyFinalizers = NULL;
++
+     /* first, make sure we stop the world */
+     while (ggc_mutex_trylock(&ggggc_worldBarrierLock) != 0) {
+         /* somebody else is collecting */
+@@ -418,7 +469,7 @@
+ 
+ #if GGGGC_GENERATIONS == 1
+     /* with only one generation, we only want a full collection */
+-    ggggc_collectFull();
++    ggggc_collectFull(&survivingFinalizers, &survivingFinalizersTail, &readyFinalizers);
+ 
+ #else
+     /************************************************************
+@@ -455,6 +506,9 @@
+         }
+     }
+ 
++    /* start pre-finalizers */
++    finalizersChecked = 0;
++
+     /* now test all our pointers */
+     while (toSearch->used) {
+         void **ptr;
+@@ -491,6 +545,9 @@
+             /* allocate in the new generation */
+             nobj = (struct GGGGC_Header *) ggggc_mallocGen1(descriptor->size, gen + 1);
+             if (!nobj) {
++                PRESERVE_ALL_FINALIZERS();
++                survivingFinalizers = survivingFinalizersTail = readyFinalizers = NULL;
++
+                 /* failed to allocate, need to collect gen+1 too */
+                 gen += 1;
+                 TOSEARCH_INIT();
+@@ -499,11 +556,11 @@
+ #endif
+ #if GGGGC_GENERATIONS > 2
+                 if (gen >= GGGGC_GENERATIONS - 1) {
+-                    ggggc_collectFull();
++                    ggggc_collectFull(&survivingFinalizers, &survivingFinalizersTail, &readyFinalizers);
+                     break;
+                 } else goto collect;
+ #else
+-                ggggc_collectFull();
++                ggggc_collectFull(&survivingFinalizers, &survivingFinalizersTail, &readyFinalizers);
+                 break;
+ #endif
+             }
+@@ -526,10 +583,37 @@
+             abort();
+         }
+ #endif
++
++        /* perhaps check finalizers */
++        if (!toSearch->used && !finalizersChecked) {
++            GGGGC_FinalizerEntry finalizer = NULL, nextFinalizer = NULL;
++
++            finalizersChecked = 1;
++
++            /* add all the finalizers themselves */
++            for (plCur = ggggc_rootPool0List; plCur; plCur = plCur->next) {
++                for (poolCur = plCur->pool; poolCur; poolCur = poolCur->next) {
++                    FINALIZER_POOL();
++                }
++            }
++            for (genCur = 1; genCur <= gen; genCur++) {
++                for (poolCur = ggggc_gens[genCur]; poolCur; poolCur = poolCur->next) {
++                    FINALIZER_POOL();
++                }
++            }
++
++            /* then make sure the finalizer queues get promoted */
++            TOSEARCH_ADD(&survivingFinalizers);
++            TOSEARCH_ADD(&survivingFinalizersTail);
++            TOSEARCH_ADD(&readyFinalizers);
++        }
++
+     }
+ 
+ #endif /* GGGGC_GENERATIONS > 1 */
+ 
++    PRESERVE_FINALIZERS();
++
+     /* heuristically expand too-small generations */
+     for (plCur = ggggc_rootPool0List; plCur; plCur = plCur->next)
+         ggggc_expandPoolList(plCur->pool, newPoolGenProto, 1);
+@@ -580,6 +664,9 @@
+     /* free the other threads */
+     ggc_barrier_wait_raw(&ggggc_worldBarrier);
+     ggc_mutex_unlock(&ggggc_worldBarrierLock);
++
++    /* run our finalizers */
++    if (readyFinalizers) ggggc_runFinalizers(readyFinalizers);
+ }
+ 
+ /* type for an element of our break table */
+@@ -685,7 +772,7 @@
+ }
+ 
+ /* perform a full, in-place collection */
+-void ggggc_collectFull()
++void ggggc_collectFull(GGGGC_FinalizerEntry *survivingFinalizersOut, GGGGC_FinalizerEntry *survivingFinalizersTailOut, GGGGC_FinalizerEntry *readyFinalizersOut)
+ {
+     struct GGGGC_PoolList *plCur;
+     struct GGGGC_Pool *poolCur;
+@@ -695,6 +782,10 @@
+     unsigned char genCur;
+     ggc_size_t i;
+ 
++    int finalizersChecked = 0;
++    GGGGC_FinalizerEntry survivingFinalizers, survivingFinalizersTail, readyFinalizers;
++    survivingFinalizers = survivingFinalizersTail = readyFinalizers = NULL;
++
+     TOSEARCH_INIT();
+ 
+     /* add our roots to the to-search list */
+@@ -737,6 +828,30 @@
+             /* add its pointers */
+             ADD_OBJECT_POINTERS(obj, descriptor);
+         }
++
++        /* possibly start handling finalizers */
++        if (!toSearch->used && !finalizersChecked) {
++            GGGGC_FinalizerEntry finalizer = NULL, nextFinalizer = NULL;
++
++            finalizersChecked = 1;
++
++            /* add all the finalizers themselves */
++            for (plCur = ggggc_rootPool0List; plCur; plCur = plCur->next) {
++                for (poolCur = plCur->pool; poolCur; poolCur = poolCur->next) {
++                    FINALIZER_POOL();
++                }
++            }
++            for (genCur = 1; genCur < GGGGC_GENERATIONS; genCur++) {
++                for (poolCur = ggggc_gens[genCur]; poolCur; poolCur = poolCur->next) {
++                    FINALIZER_POOL();
++                }
++            }
++
++            /* then make sure the finalizer queues get promoted */
++            TOSEARCH_ADD(&survivingFinalizers);
++            TOSEARCH_ADD(&survivingFinalizersTail);
++            TOSEARCH_ADD(&readyFinalizers);
++        }
+     }
+ 
+     /* find all our sizes, for later compaction */
+@@ -773,6 +888,17 @@
+             }
+         }
+     }
++#define F(finalizer) do { \
++    if (finalizer) { \
++        void *ptr = (void *) (finalizer); \
++        FOLLOW_COMPACTED_OBJECT(ptr); \
++        (finalizer) = (GGGGC_FinalizerEntry) ptr; \
++    } \
++} while(0)
++    F(survivingFinalizers);
++    F(survivingFinalizersTail);
++    F(readyFinalizers);
++#undef F
+     for (plCur = ggggc_rootPool0List; plCur; plCur = plCur->next) {
+         for (poolCur = plCur->pool; poolCur; poolCur = poolCur->next) {
+             ggggc_postCompact(poolCur);
+@@ -805,6 +931,10 @@
+         }
+     }
+ #endif
++
++    *survivingFinalizersOut = survivingFinalizers;
++    *survivingFinalizersTailOut = survivingFinalizersTail;
++    *readyFinalizersOut = readyFinalizers;
+ }
+ 
+ /* determine the size of every contiguous chunk of used or unused space in this
+diff -r c67b2f27b659 ggggc-internals.h
+--- a/ggggc-internals.h	Fri Nov 27 12:05:34 2015 -0500
++++ b/ggggc-internals.h	Fri Nov 27 12:06:45 2015 -0500
+@@ -101,6 +101,19 @@
+ /* and a lock for the descriptor descriptors */
+ extern ggc_mutex_t ggggc_descriptorDescriptorsLock;
+ 
++/* the shape for finalizer entries */
++GGC_TYPE(GGGGC_FinalizerEntry)
++    GGC_MPTR(GGGGC_FinalizerEntry, next);
++    GGC_MPTR(void *, obj);
++    GGC_MDATA(ggc_finalizer_t, finalizer);
++GGC_END_TYPE(GGGGC_FinalizerEntry,
++    GGC_PTR(GGGGC_FinalizerEntry, next)
++    GGC_PTR(GGGGC_FinalizerEntry, obj)
++    )
++
++/* and function for running finalizers */
++void ggggc_runFinalizers(GGGGC_FinalizerEntry finalizers);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff -r c67b2f27b659 ggggc/gc.h
+--- a/ggggc/gc.h	Fri Nov 27 12:05:34 2015 -0500
++++ b/ggggc/gc.h	Fri Nov 27 12:06:45 2015 -0500
+@@ -112,6 +112,9 @@
+ 
+     /* how much survived the last collection */
+     ggc_size_t survivors;
++ 
++    /* and pointer to the first finalizer in this pool */
++    void *finalizers;
+ 
+     /* and the actual content */
+     ggc_size_t start[1];
+@@ -299,6 +302,13 @@
+ /* allocate a descriptor from a descriptor slot */
+ struct GGGGC_Descriptor *ggggc_allocateDescriptorSlot(struct GGGGC_DescriptorSlot *slot);
+ 
++/* type for finalizers */
++typedef void (*ggc_finalizer_t)(void *obj);
++
++/* specify a finalizer for an object */
++void ggggc_finalize(void *obj, ggc_finalizer_t finalizer);
++#define GGC_FINALIZE(obj, finalizer) (ggggc_finalize((obj), (finalizer)))
++
+ /* global heuristic for "please stop the world" */
+ extern volatile int ggggc_stopTheWorld;
+ 

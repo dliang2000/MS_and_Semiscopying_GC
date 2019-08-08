@@ -1,0 +1,9 @@
+function second(a, b) {
+    return b;
+}
+
+function main() {
+    $print(second(40, 2));
+}
+
+main();
